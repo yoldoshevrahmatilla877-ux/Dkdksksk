@@ -1,0 +1,310 @@
+# -*- coding: utf-8 -*-
+"""Kino Drama — balans to'ldirish (CheckCard API). BITTA FAYL: sayt (HTML) + server (Flask) ichida.
+Hostingda: passenger_wsgi.py nomi bilan yuklang. Kompyuterda: python passenger_wsgi.py"""
+import os, re, time, sqlite3, secrets, hmac
+import requests
+from flask import Flask, request, session, jsonify, Response
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# ===== SOZLAMALAR (faqat shu yerni to'ldiring) =====
+SHOP_ID = "249444"
+SHOP_KEY = "YANGI_SHOP_KEY"
+MIN_AMOUNT, MAX_AMOUNT, EXPIRE_SEC = 1000, 10_000_000, 300
+# ===================================================
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE, "kino.db")
+CC_API = "https://checkcard.uz/api"
+
+app = Flask(__name__)
+_kp = os.path.join(BASE, "secret.key")
+if not os.path.exists(_kp):
+    with open(_kp, "w") as f:
+        f.write(secrets.token_hex(32))
+app.secret_key = open(_kp).read().strip()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 3650)
+
+
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    con = db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS site_users(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+      pass TEXT NOT NULL, balance INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS checkout(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, order_code TEXT UNIQUE NOT NULL,
+      user_id INTEGER NOT NULL, amount INTEGER NOT NULL, status TEXT NOT NULL,
+      created_at INTEGER NOT NULL);
+    """)
+    con.close()
+
+
+init_db()
+
+
+def cc(**params):
+    try:
+        r = requests.get(CC_API, params=params, timeout=15)
+        j = r.json()
+        return j if isinstance(j, dict) else None
+    except Exception:
+        return None
+
+
+def credit(order, amount):
+    """Buyurtmani faqat bir marta balansga qo'shadi."""
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        cur = con.execute("UPDATE checkout SET status='paid', amount=? WHERE order_code=? "
+                          "AND status IN ('pending','cancel')", (amount, order))
+        if cur.rowcount != 1:
+            con.execute("ROLLBACK"); return False
+        row = con.execute("SELECT user_id FROM checkout WHERE order_code=?", (order,)).fetchone()
+        con.execute("UPDATE site_users SET balance=balance+? WHERE id=?", (amount, row["user_id"]))
+        con.execute("COMMIT"); return True
+    except Exception:
+        try: con.execute("ROLLBACK")
+        except Exception: pass
+        return False
+    finally:
+        con.close()
+
+
+def clean(s):
+    return re.sub(r"[^A-Za-z0-9_-]", "", s or "")
+
+
+def ensure_user():
+    """Login yo'q: har bir qurilma uchun avtomatik hisob (cookie orqali)."""
+    uid = session.get("uid")
+    con = db()
+    try:
+        if uid and con.execute("SELECT 1 FROM site_users WHERE id=?", (uid,)).fetchone():
+            return uid
+        name = "mehmon_" + secrets.token_hex(4)
+        cur = con.execute("INSERT INTO site_users(username, pass) VALUES(?,?)",
+                          (name, generate_password_hash(secrets.token_hex(8))))
+        session.permanent = True
+        session["uid"] = cur.lastrowid
+        return cur.lastrowid
+    finally:
+        con.close()
+
+
+def need_user():
+    return ensure_user(), None
+
+
+def current_user():
+    uid = session.get("uid")
+    if not uid:
+        return None
+    con = db()
+    row = con.execute("SELECT username, balance FROM site_users WHERE id=?", (uid,)).fetchone()
+    con.close()
+    if not row:
+        session.clear()
+    return row
+
+
+@app.get("/")
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+
+@app.get("/api/me")
+def api_me():
+    ensure_user()
+    me = current_user()
+    return jsonify(ok=True, username=me["username"], balance=me["balance"])
+
+
+@app.post("/api/create")
+def api_create():
+    uid, bad = need_user()
+    if bad: return bad
+    try:
+        amount = int(request.form.get("amount", 0))
+    except ValueError:
+        amount = 0
+    if not (MIN_AMOUNT <= amount <= MAX_AMOUNT):
+        return jsonify(ok=False, error="Summa 1 000 dan 10 000 000 so'mgacha bo'lishi kerak"), 400
+    con = db()
+    try:
+        con.execute("UPDATE checkout SET status='cancel' WHERE user_id=? AND status='pending' AND created_at<?",
+                    (uid, int(time.time()) - EXPIRE_SEC))
+        if con.execute("SELECT 1 FROM checkout WHERE user_id=? AND status='pending'", (uid,)).fetchone():
+            return jsonify(ok=False, error="Sizda tugallanmagan to'lov bor. Avval uni yakunlang yoki bekor qiling."), 409
+        res = None
+        for i in range(20):  # band summa bo'lsa 1 so'mdan oshiramiz
+            res = cc(method="create", shop_id=SHOP_ID, shop_key=SHOP_KEY, amount=amount + i, payurl="true")
+            if res and res.get("status") == "success":
+                amount += i; break
+            if not res or "pending payment" not in str(res.get("message", "")).lower():
+                break
+        if not res or res.get("status") != "success":
+            return jsonify(ok=False, error=(res or {}).get("message") or "To'lov tizimi bilan bog'lanib bo'lmadi"), 502
+        order, am = res["order"], int(res.get("amount", amount))
+        con.execute("INSERT INTO checkout(order_code,user_id,amount,status,created_at) VALUES(?,?,?,'pending',?)",
+                    (order, uid, am, int(time.time())))
+        return jsonify(ok=True, order=order, amount=am, card=res.get("card", ""),
+                       payurl=res.get("payurl", ""), expires_in=EXPIRE_SEC)
+    finally:
+        con.close()
+
+
+@app.post("/api/check")
+def api_check():
+    uid, bad = need_user()
+    if bad: return bad
+    order = clean(request.form.get("order"))
+    con = db()
+    try:
+        row = con.execute("SELECT status, amount, created_at FROM checkout WHERE order_code=? AND user_id=?",
+                          (order, uid)).fetchone()
+        if not row:
+            return jsonify(ok=False, error="Buyurtma topilmadi"), 404
+        status, amount = row["status"], row["amount"]
+        if status == "pending":
+            if row["created_at"] + EXPIRE_SEC < time.time():
+                cc(method="cancel", order=order)
+                con.execute("UPDATE checkout SET status='cancel' WHERE order_code=? AND status='pending'", (order,))
+                status = "cancel"
+            else:
+                r = cc(method="check", order=order)
+                if r and r.get("status") == "success":
+                    st = r["data"].get("status")
+                    if st == "paid":
+                        credit(order, int(r["data"]["amount"])); status, amount = "paid", int(r["data"]["amount"])
+                    elif st == "cancel":
+                        con.execute("UPDATE checkout SET status='cancel' WHERE order_code=? AND status='pending'", (order,))
+                        status = "cancel"
+        bal = con.execute("SELECT balance FROM site_users WHERE id=?", (uid,)).fetchone()["balance"]
+        return jsonify(ok=True, status=status, amount=amount, balance=bal)
+    finally:
+        con.close()
+
+
+@app.post("/api/cancel")
+def api_cancel():
+    uid, bad = need_user()
+    if bad: return bad
+    order = clean(request.form.get("order"))
+    con = db()
+    cur = con.execute("UPDATE checkout SET status='cancel' WHERE order_code=? AND user_id=? AND status='pending'",
+                      (order, uid))
+    con.close()
+    if cur.rowcount == 1:
+        cc(method="cancel", order=order)
+    return jsonify(ok=True)
+
+
+@app.post("/webhook")
+def webhook():
+    data = request.get_json(silent=True) or {}
+    if not data.get("order"):
+        return "bad", 400
+    if not hmac.compare_digest(SHOP_KEY, str(data.get("shopkey", ""))):
+        return "forbidden", 403
+    order = clean(data["order"])
+    r = cc(method="check", order=order)  # ishonch uchun API orqali qayta tekshiramiz
+    if r and r.get("status") == "success" and r["data"].get("status") == "paid":
+        credit(order, int(r["data"]["amount"]))
+    return "OK"
+
+
+
+
+INDEX_HTML = r'''<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Kino Drama</title>
+<style>
+:root{color-scheme:dark;--bg:#111;--panel:#1b1b1b;--line:#2a2a2a;--g1:#00ff6a;--g2:#00b84a;--mut:#8a8a8a}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:#000;color:#fff;font-family:Roboto,system-ui,sans-serif}
+.wrap{max-width:520px;margin:0 auto;padding:24px 20px}
+.top{display:flex;justify-content:space-between;margin-bottom:22px}.top a{color:var(--mut);text-decoration:none;font-size:14px}
+.card{position:relative;overflow:hidden;border-radius:26px;padding:26px;background:linear-gradient(135deg,#1fe35f,#07a143);color:#06140b;box-shadow:0 0 40px rgba(0,255,106,.25)}
+.card:before{content:"";position:absolute;right:-60px;top:-60px;width:170px;height:170px;border-radius:50%;background:rgba(255,255,255,.12)}
+.card small{display:block;font-size:15px;opacity:.75}.bal{font-size:34px;font-weight:800;margin:8px 0 18px}
+.dark{border:0;border-radius:16px;padding:14px 22px;font-size:16px;font-weight:700;background:#06140b;color:var(--g1)}
+#ov{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-end}#ov.on{display:flex}
+.sheet{width:100%;max-width:520px;margin:0 auto;background:var(--bg);border-radius:28px 28px 0 0;padding:14px 20px calc(28px + env(safe-area-inset-bottom,0px));max-height:94vh;overflow:auto}
+.grab{width:44px;height:4px;border-radius:4px;background:#444;margin:0 auto 20px}h1{font-size:26px;margin:0 0 16px}
+.num{font-size:25px;font-weight:700;letter-spacing:1.5px;margin:14px 0 18px;position:relative}
+.row{display:flex;justify-content:space-between;align-items:center}.copy{border:0;background:rgba(0,0,0,.18);width:44px;height:40px;border-radius:12px;font-size:18px}
+input{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:22px;padding:19px;font-size:18px;color:#fff;outline:0;margin:0 0 12px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.chip{background:var(--panel);border:1px solid var(--line);color:#ddd;border-radius:14px;padding:9px 14px;font-size:14px}
+.btn{width:100%;border:0;border-radius:22px;padding:18px;font-size:17px;font-weight:700;margin-top:10px}
+.main{background:linear-gradient(90deg,var(--g1),var(--g2));color:#04110a}.ghost{background:transparent;border:1px solid var(--line);color:var(--mut);font-weight:500}.main:disabled{opacity:.5}
+.info{background:var(--panel);border:1px dashed #3a3a3a;border-radius:20px;padding:16px;text-align:center;color:#ccc;margin:14px 0;line-height:1.6}
+.info b{color:var(--g1);font-size:22px}.timer{font-size:26px;font-weight:700;color:var(--g1)}
+.err{color:#ff6b6b;text-align:center;min-height:20px;margin:6px 0}.ok{text-align:center;padding:16px 0}.big{font-size:60px}.hide{display:none}
+.box{margin-top:12vh;background:var(--bg);border-radius:28px;padding:28px}.lnk{display:block;text-align:center;margin-top:16px;color:var(--g1);text-decoration:none}
+</style></head><body>
+<div class="wrap" id="appv">
+  <div class="top"><b>🎬 Kino Drama</b></div>
+  <div class="card"><small>Balansingiz</small><div class="bal" id="bal">0 so'm</div>
+    <button class="dark" id="open">➕ Hisobni to'ldirish</button></div>
+</div>
+<div id="ov"><div class="sheet"><div class="grab"></div><h1>Hisobni to'ldirish</h1>
+  <div id="s1">
+    <div class="chips"><button class="chip" data-a="5000">5 000</button><button class="chip" data-a="10000">10 000</button><button class="chip" data-a="25000">25 000</button><button class="chip" data-a="50000">50 000</button><button class="chip" data-a="100000">100 000</button></div>
+    <input id="amount" type="number" inputmode="numeric" placeholder="To'lov summasi (so'm)">
+    <p class="err" id="e1"></p>
+    <button class="btn main" id="go">💳 TO'LOVNI YARATISH</button>
+    <button class="btn ghost" id="c1">Bekor qilish</button>
+  </div>
+  <div id="s2" class="hide">
+    <div class="card"><small>Karta: KINO DRAMA</small><div class="num" id="card">—</div>
+      <div class="row"><small>Humo / Uzcard</small><button class="copy" id="cp">⧉</button></div></div>
+    <div class="info">Aynan shu summani o'tkazing:<br><b id="pay"></b> so'm<br><span class="timer" id="t">05:00</span><br><small>To'lov tushishi bilan balans avtomatik to'ldiriladi ⚡</small></div>
+    <a class="btn main hide" id="pu" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none">🔗 To'lov sahifasini ochish</a>
+    <button class="btn ghost" id="c2">Bekor qilish</button>
+  </div>
+  <div id="s3" class="hide"><div class="ok"><div class="big" id="ico">✅</div><h2 id="msg"></h2><p id="nb" style="color:var(--mut)"></p></div>
+    <button class="btn main" id="done">YOPISH</button></div>
+</div></div>
+<script>
+const $=i=>document.getElementById(i),fmt=n=>String(n).replace(/\B(?=(\d{3})+(?!\d))/g,' ');
+let order=null,poll=null,tick=null,paid=false;
+const api=async(a,d={})=>(await fetch('api/'+a,{method:'POST',body:new URLSearchParams(d)})).json();
+const show=n=>['s1','s2','s3'].forEach((s,i)=>$(s).classList.toggle('hide',i+1!==n));
+const stop=()=>{clearInterval(poll);clearInterval(tick)};
+const close=()=>{stop();$('ov').classList.remove('on');if(paid)location.reload()};
+function fin(i,m,n){stop();$('ico').textContent=i;$('msg').textContent=m;$('nb').textContent=n||'';show(3)}
+$('open').onclick=()=>{show(1);$('amount').value='';$('e1').textContent='';paid=false;$('ov').classList.add('on')};
+document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>$('amount').value=c.dataset.a);
+$('c1').onclick=$('done').onclick=close;$('ov').onclick=e=>{if(e.target===$('ov'))close()};
+$('go').onclick=async()=>{$('e1').textContent='';$('go').disabled=true;
+ try{const r=await api('create',{amount:$('amount').value});if(!r.ok){$('e1').textContent=r.error;return}
+  order=r.order;$('card').textContent=r.card.replace(/(\d{4})(?=\d)/g,'$1 ');$('pay').textContent=fmt(r.amount);if(/^https:\/\/checkcard\.uz\//.test(r.payurl||'')){$('pu').href=r.payurl;$('pu').classList.remove('hide')}show(2);
+  let left=r.expires_in;tick=setInterval(()=>{left--;if(left<=0){fin('⏰',"To'lov muddati tugadi");return}
+   $('t').textContent=String(Math.floor(left/60)).padStart(2,'0')+':'+String(left%60).padStart(2,'0')},1000);
+  poll=setInterval(check,3000);
+ }catch(e){$('e1').textContent='Tarmoq xatosi'}finally{$('go').disabled=false}};
+async function check(){try{const r=await api('check',{order});if(!r.ok)return;
+ if(r.status==='paid'){paid=true;$('bal').textContent=fmt(r.balance)+" so'm";fin('✅',fmt(r.amount)+" so'm qo'shildi","Joriy balans: "+fmt(r.balance)+" so'm")}
+ else if(r.status==='cancel')fin('❌',"To'lov bekor qilindi")}catch(e){}}
+$('c2').onclick=async()=>{await api('cancel',{order});fin('❌',"To'lov bekor qilindi")};
+$('cp').onclick=()=>navigator.clipboard&&navigator.clipboard.writeText($('card').textContent.replace(/\s/g,''));
+
+// ---- balansni yuklash ----
+async function load(){try{const r=await (await fetch('api/me')).json();if(r.ok)$('bal').textContent=fmt(r.balance)+" so'm"}catch(e){}}
+load();
+</script>
+'''
+
+
+application = app  # Passenger/WSGI uchun
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
